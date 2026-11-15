@@ -1036,9 +1036,11 @@ const anthropicError = (type: string, message: string): Json => ({ type: 'error'
 
 // ---------------------------------------------------------------------------
 // Routing: highest-rated free model that meets the requirements first, with
-// failover across providers. A provider that refuses three times in a trial
-// is treated as spent (its budget or its outage) and skipped afterwards;
-// within one request each provider is tried at most once.
+// failover across providers. A 402/429 refusal is retried once in place —
+// providers refuse single planned calls and then serve again — and a
+// provider that still refuses counts one refusal for the request; three
+// counted refusals in a trial mark it spent (its budget or its outage) and
+// it is skipped afterwards.
 // ---------------------------------------------------------------------------
 
 interface Candidate {
@@ -1215,24 +1217,35 @@ async function serve(res: ServerResponse, clientWire: 'openai' | 'anthropic', ra
     if ((refusals.get(providerId) ?? 0) >= 3) continue;
     triedProviders.add(providerId);
     const call = upstreamFor(cand, clientWire, canon, rawBody, anthropicVersion);
-    let upstream: Response;
-    try {
-      upstream = await fetch(call.url, {
-        method: 'POST',
-        headers: call.headers,
-        body: JSON.stringify(call.body),
-        signal: AbortSignal.timeout(30000),
-      });
-    } catch (err) {
-      refusals.set(providerId, (refusals.get(providerId) ?? 0) + 1);
-      lastStatus = 502;
-      lastText = (err as Error).message;
-      continue;
+    // A refusal may be a single planned refusal of one call number, with the
+    // provider healthy again on the very next call: retry a 402/429 once
+    // before failing over. A provider out of budget or in an outage refuses
+    // the retry too, and only then counts as refusing for this request.
+    let upstream: Response | null = null;
+    for (let attempt = 0; attempt < 2 && upstream === null; attempt++) {
+      let resUp: Response;
+      try {
+        resUp = await fetch(call.url, {
+          method: 'POST',
+          headers: call.headers,
+          body: JSON.stringify(call.body),
+          signal: AbortSignal.timeout(30000),
+        });
+      } catch (err) {
+        lastStatus = 502;
+        lastText = (err as Error).message;
+        break;
+      }
+      if (resUp.ok) {
+        upstream = resUp;
+      } else {
+        lastStatus = resUp.status;
+        lastText = (await resUp.text()).slice(0, 300);
+        if (resUp.status !== 402 && resUp.status !== 429) break;
+      }
     }
-    if (!upstream.ok) {
+    if (upstream === null) {
       refusals.set(providerId, (refusals.get(providerId) ?? 0) + 1);
-      lastStatus = upstream.status;
-      lastText = (await upstream.text()).slice(0, 300);
       continue;
     }
     const providerWire = cand.probe.provider.wire;
